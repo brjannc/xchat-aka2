@@ -21,15 +21,15 @@ use warnings;
 use DBI;
 
 my $NAME = "aka2";
-my $VERSION = "0.3.2";
+my $VERSION = "0.4.0";
 my $DESC = "also-known-as plugin for XChat";
 
 my $DEBUG = 0;
 
 my $database_handle = db_connect();
-my $enabled_channels = load($database_handle);
-my $hook_options = { data => [$database_handle, $enabled_channels] };
+load($database_handle);
 
+my $hook_options = { data => [$database_handle] };
 Xchat::register($NAME, $VERSION, $DESC, \&unload);
 Xchat::hook_print("Join", \&on_join, $hook_options);
 Xchat::hook_print("Change Nick", \&on_change_nick, $hook_options);
@@ -39,7 +39,6 @@ Xchat::print("* $NAME $VERSION loaded :)");
 
 sub load {
     my ($dbh) = @_;
-    my $channels = {};
 
     eval {
 	$dbh->begin_work;
@@ -48,8 +47,7 @@ sub load {
 
 	vacuum($dbh);
 
-	# load the enabled channels into a hash "set"
-	$channels = $dbh->selectall_hashref(q/SELECT channel FROM channels/, "channel");
+	list($dbh);
     };
 
     if ($@) {
@@ -58,9 +56,6 @@ sub load {
 	die;
     }
 
-    Xchat::print("* $NAME watching: " . join(" ", keys %$channels)) if scalar(keys %$channels);
-
-    return $channels;
 }
 
 sub db_connect {
@@ -82,10 +77,6 @@ sub db_init {
     $dbh->do(q/CREATE TABLE IF NOT EXISTS hosts (host_id INTEGER PRIMARY KEY, host STRING UNIQUE NOT NULL)/);
     $dbh->do(q/CREATE TABLE IF NOT EXISTS nicks (nick_id INTEGER PRIMARY KEY, nick STRING UNIQUE NOT NULL, last_seen INTEGER NOT NULL DEFAULT (strftime('%s', 'now')))/);
     $dbh->do(q/CREATE TABLE IF NOT EXISTS hosts_nicks (host_id INTEGER, nick_id INTEGER, PRIMARY KEY (host_id, nick_id), FOREIGN KEY (host_id) REFERENCES hosts(host_id), FOREIGN KEY (nick_id) REFERENCES nicks(nick_id))/);
-
-    # $dbh->do(q/CREATE INDEX IF NOT EXISTS host_idx ON hosts (host)/);
-    # $dbh->do(q/CREATE INDEX IF NOT EXISTS nick_idx ON nicks (nick)/);
-    # $dbh->do(q/CREATE INDEX IF NOT EXISTS hosts_nicks_idx ON hosts_nicks (host_id, nick_id)/);
 }
 
 sub other_nicks {
@@ -105,6 +96,13 @@ sub host_id {
     my ($dbh, $host) = @_;
     my $sth = $dbh->prepare_cached(q/SELECT host_id FROM hosts WHERE host = ? LIMIT 1/);
     my @row = $dbh->selectrow_array($sth, undef, $host);
+    return (@row ? $row[0] : 0);
+}
+
+sub is_watching {
+    my ($dbh, $channel) = @_;
+    my $sth = $dbh->prepare_cached(q/SELECT COUNT(1) FROM channels WHERE channel = ?/);
+    my @row = $dbh->selectrow_array($sth, undef, $channel);
     return (@row ? $row[0] : 0);
 }
 
@@ -151,19 +149,19 @@ sub update {
 	$sth->execute($host_id, $nick_id);
     }
 
-    if ($msg ne "") {
+    if ($msg) {
 	Xchat::print("* $NAME: --> $msg") if $DEBUG;
     }
 }
 
 # Event: $1 is now known as $2
 sub on_change_nick {
-    my ($dbh, $channels) = @{$_[1]};
+    my ($dbh) = @{$_[1]};
 
     # check to see if we're enabled for this channel
     my $channel = lc Xchat::context_info->{channel};
 
-    unless (exists $channels->{$channel} || $DEBUG) {
+    unless (is_watching($dbh, $channel) || $DEBUG) {
 	Xchat::print("* $NAME: ignoring $channel") if $DEBUG;
 	return Xchat::EAT_NONE;
     }
@@ -189,11 +187,11 @@ sub on_change_nick {
 
 # Event: $1 ($3) has joined $2
 sub on_join {
-    my ($dbh, $channels) = @{$_[1]};
+    my ($dbh) = @{$_[1]};
     my $channel = lc $_[0][1];
 
     # check to see if we're enabled for this channel
-    unless (exists $channels->{$channel} || $DEBUG) {
+    unless (is_watching($dbh, $channel) || $DEBUG) {
     	Xchat::print("* $NAME: ignoring $channel") if $DEBUG;
     	return Xchat::EAT_NONE;
     }
@@ -228,7 +226,7 @@ sub on_join {
 sub on_command {
     my $argv = $_[0];
     my $argc = scalar(@$argv);
-    my ($dbh, $channels) = @{$_[2]};
+    my ($dbh) = @{$_[2]};
     
     if ($argc < 2) {
 	usage();
@@ -245,6 +243,10 @@ sub on_command {
 	# /aka vacuum
 	vacuum($dbh);
 	Xchat::print("* $NAME: vacuum complete");
+	return Xchat::EAT_ALL;
+    } elsif ($command eq "list") {
+	# /aka list
+	list($dbh);
 	return Xchat::EAT_ALL;
     }
 
@@ -279,6 +281,7 @@ usage:
   /aka help                show this help
   /aka watch <channel>     watch a channel
   /aka unwatch <channel>   unwatch a channel
+  /aka list                list watched channels
   /aka whois <nick>        show a user's other known nicks
   /aka import <file>       import data from an external file
   /aka vacuum              vacuum the database
@@ -290,6 +293,20 @@ sub vacuum {
     my ($dbh) = @_;
     $dbh->do(q/VACUUM/);
     $dbh->do(q/ANALYZE/);
+}
+
+sub list {
+    my ($dbh) = @_;
+
+    # load the enabled channels into a hash "set"
+    my $sth = $dbh->prepare_cached(q/SELECT channel FROM channels ORDER BY channel ASC/);
+    my $channels = $dbh->selectall_hashref($sth, "channel");
+
+    if (scalar(keys %$channels)) {
+	Xchat::print("* watching: " . join(" ", keys %$channels));
+    } else {
+	Xchat::print("* not watching any channels");
+    }
 }
 
 sub import {
@@ -346,12 +363,16 @@ sub whois {
 
 sub watch {
     my ($dbh, $channel) = @_;
-    Xchat::print("* $NAME: this function is not yet implemented");
+    my $sth = $dbh->prepare_cached(q/INSERT OR IGNORE INTO channels (channel) VALUES (?)/);
+    $sth->execute(lc $channel);
+    Xchat::print("* now watching $channel");
 }
 
 sub unwatch {
     my ($dbh, $channel) = @_;
-    Xchat::print("* $NAME: this function is not yet implemented");
+    my $sth = $dbh->prepare_cached(q/DELETE FROM channels WHERE channel = ?/);
+    $sth->execute(lc $channel);
+    Xchat::print("* no longer watching $channel");
 }
 
 sub unload {
